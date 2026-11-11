@@ -1,0 +1,3 @@
+v1 patch|reinst
+v2 restart note=struct `Item` changed its layout, and `live::ITEMS` may hold values of it in the old one
+v3 patch|reinst

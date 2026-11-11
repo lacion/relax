@@ -1,0 +1,26 @@
+[package]
+name = "bt-app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "nh"
+path = "src/bin/nh.rs"
+harness = false
+
+[[test]]
+name = "plain"
+path = "tests/plain.rs"
+harness = false
+
+# `makepad test bt-app --features broken` (run.sh): one target that does not compile; the
+# package's other targets still run and pass, each from the package's one test program
+[features]
+broken = []
+
+[[test]]
+name = "broken"
+path = "tests/broken.rs"
+required-features = ["broken"]
