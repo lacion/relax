@@ -17,7 +17,7 @@ running process when you save a file.
 | **Change one function in a running program** | rebuild, relink, restart: program state lost | **patched into the running process**: state kept |
 | **Save a file → 92 tests re-run** | rebuild the test binary first | **2.2 s** after the save |
 | **Relaunch an unchanged program** | no-op build check, then start | **~0.1 s** from a warm cache |
-| **Speed of optimised code** | 1.00× (LLVM release) | **1.06×** on the benchmark chart (1.24× on the hardest workload we track) |
+| **Speed of optimised code** | 1.00× (LLVM, `--release`) | **1.14–1.26×** on real workloads; 2.3× on dense numeric loops, which it doesn't vectorise yet ([details](#where-llvm-still-wins)) |
 | **Type- and borrow-checked before it runs** | yes | **yes** |
 | **Needs** | rustc, LLVM, a linker | **Relax**, one Rust library (438k lines, 0 crates.io dependencies) |
 
@@ -48,7 +48,7 @@ safety and drops the charge.
 | --- | --- | --- |
 | **Getting started** | Build everything first. On a large app, minutes pass before `main` runs. | **Start from source now.** A small app boots cold in about 3 s; a large 3D game reaches its first frame in about 13 s. |
 | **Making a change** | Rebuild the crate and everything that depends on it, relink, restart, and get back to where you were. | **Saving is the build.** Only the functions you changed are rechecked and recompiled, and they're swapped into the running program, which keeps its state, windows and connections. |
-| **Run-time speed** | Fast, after a long optimised build. | **Fast, while it runs.** Code starts on an interpreter and climbs to O1 and O3 in the background. Optimised Relax code runs at 1.06× rustc release on the benchmark chart. |
+| **Run-time speed** | Fast, after a long optimised build. | **Fast, while it runs.** Code starts on an interpreter and climbs to O1 and O3 in the background. On real workloads, optimised Relax code runs within 1.14–1.26× of rustc `--release`, and the gap is closing every week. |
 | **Safety** | Everything type- and borrow-checked. | **The same.** Relax never runs code it hasn't checked. |
 | **Your crates** | Path, git, crates.io, vendored, proc macros. | **The same crates, as written,** procedural macros included. |
 | **Caches** | Incremental artefacts on disk that can go stale and need `cargo clean`. | **Every result is keyed by the hashes of its inputs.** A hit is exactly what a fresh compile would produce. A warm start recompiles nothing. |
@@ -113,6 +113,43 @@ hour, and dozens of changes land every day, each checked under Relax before it m
 | **Native code** | Everything is native. | **Crates that must stay native (OS layers, GPU, audio) export an interface with `#[relax_api]`.** JIT code calls them through the C ABI planner, with per-thread heap routing across the boundary. |
 | **Visibility** | Compiler timings after the fact. | **A live flight recorder,** with hitch events and compile profilers. |
 | **Back ends** | LLVM, then a system linker. | **Its own x86-64 and AArch64 code generators,** with no linker and no LLVM. |
+
+---
+
+## Where LLVM still wins
+
+LLVM has decades of optimisation work behind it, and in steady state its code is still faster than
+Relax's. These are our own measurements: warm JIT against a native build of the same source, with the same
+inputs, as wall-clock ratios (lower is better, 1.00× = LLVM).
+
+| Workload | CPU | vs rustc `--release` | Measured |
+| --- | --- | --- | --- |
+| 3D-print slicer, first slice of a part, 4 threads | x86-64 (Zen 4) | **1.14×** (cycles 1.15×, instructions 1.26×) | 2026-11-11 |
+| Same, 8 threads | x86-64 (Zen 4) | **1.17×** | 2026-11-11 |
+| Same, 4 threads | AArch64 (Apple M4) | **1.24×** (before this week's x86 gains were ported) | 2026-11-09 |
+| CAD B-rep modelling round | x86-64 (Zen 4) | **1.26×** | 2026-11-10 |
+| Script VM interpreter loop | x86-64 (Zen 4) | **1.19×** | 2026-11-11 |
+| Dense numeric kernel (Cholesky factorisation) | x86-64 (Zen 4) | **2.29×**: LLVM vectorises it with AVX-512, Relax doesn't vectorise loops yet | 2026-11-10 |
+| Any workload against `--profile host` (opt-level 3, 16 codegen units) | | **not measured yet** | |
+
+`--release` here is opt-level 3 with `target-cpu=native`, incremental, without LTO.
+
+**Where the gap comes from**, from instruction-level comparisons of the same functions. The gap is extra
+instructions rather than stalls: 1.26× the instructions cost only 1.15× the cycles.
+
+| Cause | Extra instructions (slicer run) |
+| --- | --- |
+| Compares kept as bool registers and recomputed | ~25 G |
+| Register copies (two-address form, coalescing misses) | ~23 G |
+| Stack traffic: loop state kept in stack slots; 12 allocatable registers against rustc's 15 | ~22 G |
+| Extra loop-control and check branches, invariant tests left inside loops | ~13 G |
+| Loads not folded into compares, i128 arithmetic, rematerialised constants, smaller items | ~33 G |
+| Runtime outside the generated code (memcpy, allocator wrappers, TLS access, stubs) | ~40 G |
+| No loop vectorisation, shallow unrolling | most of the numeric-kernel gap |
+
+What isn't a cause: inlining. Relax inlines more than rustc does.
+
+Every row in this table is a work item, and the slicer gap went from 1.26× to 1.14× in the last three days.
 
 ---
 
