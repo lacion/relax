@@ -1,0 +1,17 @@
+[package]
+name = "makepad-micro-proc-macro"
+version = "1.0.0"
+authors = ["Makepad <info@makepad.nl>"]
+edition = "2021"
+description = "Makepad micro proc macro util lib"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/makepad/makepad/"
+repository = "https://github.com/makepad/makepad/"
+metadata.makepad-auto-version = "2tKeN-afCtZGYbB_BxPOVxkh0W4="
+
+[features]
+## Back the token types with Relax's token model (relax-lex; the libraries linked into relax) instead of rustc's proc_macro.
+relax-tokens = ["dep:relax-lex"]
+
+[dependencies]
+relax-lex = { workspace = true, optional = true }

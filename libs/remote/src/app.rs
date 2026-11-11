@@ -1,0 +1,642 @@
+//! Driving an app's remote commands from a command line: `makepad-remote app <pid|app|socket>
+//! <command> [k=v ...]` and `makepad inspect <pid> <command> ...` are two front ends that only
+//! parse argv and call [`run`]. Every command is a `cmd` request; the ones that are images are
+//! answered here, client side, from the `frames` service, and the client writes the PNG files
+//! (default folder `$TMPDIR/makepad-remote/<app>-<pid>/`) and prints their paths:
+//!
+//! - `grab [w=ID] [scale=F] [out=FILE]`, `tweak grab ...`: one frame
+//! - `gseq [n=8] [every_ms=50] [scale=F] [w=ID] [out=DIR]`: n frames at a cadence
+//! - `gq [scale=F] [w=ID] [if_user_seq=N]`: a frame of every window, then `quit`
+//! - `tweak final`: the app's answer, plus `"png"` (the composited window) when the user drew
+//! - `tools`: the app's AI services and their tools (the `app` service's `list`)
+//! - `call <service>.<tool> [<instance>] [<json args>]`: one AI tool call (progress lines, then
+//!   the result)
+
+use crate::discovery;
+use crate::frames::{self, Record};
+use crate::link::{Client, Error};
+use std::path::{Path, PathBuf};
+
+/// Frames of one folder kept per window (older ones are deleted when a new one is written).
+const KEPT_PER_WINDOW: usize = 64;
+
+/// The `app` service request (the app's AI tools) of a command line, when it is one: `tools`
+/// (the service's `list`) or `call <service>.<tool> [<instance>] [<json args>]`, the arguments
+/// being the rest of the line from its first `{`. Err: the usage of a `call` without its tool.
+/// Every other command is the `cmd` service's (None).
+pub fn app_request_of(line: &str) -> Option<Result<String, String>> {
+    let (head, args) = match line.find('{') {
+        Some(at) => (&line[..at], line[at..].trim()),
+        None => (line, "{}"),
+    };
+    let mut words = head.split_whitespace();
+    if matches!(words.clone().next(), Some("tools" | "call")) {
+        if let Err(e) = crate::params::validate(words.clone().skip(1).filter_map(|w| w.split_once('=').map(|(k, _)| k)), "") {
+            return Some(Err(e));
+        }
+    }
+    match words.next()? {
+        "tools" => Some(Ok("list".to_string())),
+        "call" => {
+            let Some(tool) = words.next() else {
+                return Some(Err("call <service>.<tool> [<instance>] [<json args>]".into()));
+            };
+            let instance: Vec<&str> = words.collect();
+            let head = if instance.is_empty() { format!("call {tool}") } else { format!("call {tool} {}", instance.join(" ")) };
+            Some(Ok(format!("{head}\n{args}")))
+        }
+        _ => None,
+    }
+}
+
+/// Words (the command, its sub-command) and `k=v` arguments of an argv.
+pub fn split_args(argv: &[String]) -> (Vec<String>, Vec<(String, String)>) {
+    let (mut words, mut kv) = (Vec::new(), Vec::new());
+    for a in argv {
+        match a.split_once('=') {
+            Some((k, v)) if !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')) => kv.push((k.trim_start_matches("--").to_string(), v.to_string())),
+            _ => words.push(a.clone()),
+        }
+    }
+    (words, kv)
+}
+
+/// The request line of a typed command's words. Code an agent passes (`eval <expr>`, `probe add
+/// <hook> <code>`) keeps its text: it goes as a JSON request (`key=value` words split it
+/// otherwise, and `=`/`=>` are lost). Every other command is its words.
+pub fn typed_line(words: &[String]) -> String {
+    if words.is_empty() {
+        return "help".to_string();
+    }
+    let opt = |w: &str| -> Option<(String, String)> {
+        let w = w.trim_start_matches("--");
+        let (k, v) = w.split_once('=').unwrap_or((w, ""));
+        matches!(k, "in" | "mutate" | "panic" | "domain").then(|| (k.to_string(), if v.is_empty() && k == "mutate" { "1".to_string() } else { v.to_string() }))
+    };
+    let json = |cmd: &str, kv: &[(String, String)]| {
+        let mut s = format!("{{\"cmd\":{}", crate::json_str(cmd));
+        for (k, v) in kv {
+            s.push_str(&format!(",{}:{}", crate::json_str(k), crate::json_str(v)));
+        }
+        s.push('}');
+        s
+    };
+    match words[0].as_str() {
+        // the app service's: its JSON arguments are the rest of the line, as typed
+        "call" | "tools" => words.join(" "),
+        "eval" => {
+            // options first (`--in path` or `in=path`, `mutate=1`, `panic=P1`), then the expression
+            let mut kv = Vec::new();
+            let mut i = 1;
+            while i < words.len() {
+                if words[i] == "--in" && i + 1 < words.len() {
+                    kv.push(("in".to_string(), words[i + 1].clone()));
+                    i += 2;
+                } else if let Some(o) = words[i].contains('=').then(|| opt(&words[i])).flatten().or_else(|| (words[i] == "--mutate").then(|| ("mutate".to_string(), "1".to_string()))) {
+                    kv.push(o);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            kv.push(("expr".to_string(), words[i..].join(" ")));
+            json("eval", &kv)
+        }
+        "probe" if words.get(1).map(String::as_str) == Some("add") && words.len() > 3 => {
+            let mut rest: Vec<String> = words[3..].to_vec();
+            let mut kv = Vec::new();
+            while rest.last().is_some_and(|w| w == "mutate=1" || w == "--mutate") {
+                rest.pop();
+                kv.push(("mutate".to_string(), "1".to_string()));
+            }
+            kv.push(("code".to_string(), rest.join(" ")));
+            json(&format!("probe add {}", words[2]), &kv)
+        }
+        // a value with spaces (`q=Save as`): a plain line is split on them, a JSON one keeps them
+        _ if words.iter().any(|w| w.contains('=') && w.contains(char::is_whitespace)) => {
+            let (kv, cmd): (Vec<&String>, Vec<&String>) = words.iter().partition(|w| w.contains('='));
+            let kv: Vec<(String, String)> = kv.iter().filter_map(|w| w.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            json(&cmd.iter().map(|w| w.as_str()).collect::<Vec<_>>().join(" "), &kv)
+        }
+        _ => words.join(" "),
+    }
+}
+
+/// The request line for the `cmd` service: one flat JSON object, so values keep their spaces.
+pub fn request_line(words: &[String], kv: &[(String, String)]) -> String {
+    let mut line = format!("{{\"cmd\":{}", crate::json_str(&words.join(" ")));
+    for (k, v) in kv {
+        // `cmd` is the request's own field; the Command-key modifier of an input command goes by `logo`
+        let k = if k == "cmd" { "logo" } else { k };
+        line.push_str(&format!(",{}:{}", crate::json_str(k), crate::json_str(v)));
+    }
+    line.push('}');
+    line
+}
+
+fn get<'a>(kv: &'a [(String, String)], keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|k| kv.iter().find(|x| x.0 == *k).map(|x| x.1.as_str()))
+}
+
+/// Like [`run`] for a request typed as one line (words split on spaces).
+pub fn run_line(client: &Client, line: &str, each: &mut dyn FnMut(&str) -> bool) -> Result<bool, Error> {
+    // a JSON request goes as it is (its values keep their spaces and `=`)
+    if line.trim_start().starts_with('{') {
+        let mut err = false;
+        let mut lines = client.cmd(line.trim())?;
+        while let Some(l) = lines.next() {
+            let l = l?;
+            err |= l.starts_with("{\"err\":");
+            if !each(&l) {
+                break;
+            }
+        }
+        return Ok(err);
+    }
+    let argv: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+    run(client, &argv, each)
+}
+
+/// Runs one command: `each` gets every answer line (the `end` line left out; false stops the
+/// reading). Ok(true) when the answer had an error.
+pub fn run(client: &Client, argv: &[String], each: &mut dyn FnMut(&str) -> bool) -> Result<bool, Error> {
+    run_inner(client, argv, each, false).map(|r| r.0)
+}
+
+/// As [`run`], also returning the `end` line of the answer (it carries the fields the app adds,
+/// such as `"user_seq"`). The client-side commands have no end line of their own: the line of
+/// a `ping` that follows them stands in, and `gq` has none (the app is gone).
+pub fn run_end(client: &Client, argv: &[String], each: &mut dyn FnMut(&str) -> bool) -> Result<(bool, Option<String>), Error> {
+    run_inner(client, argv, each, true)
+}
+
+/// Whether this side answers `argv` itself by reading the app's `frames` service (`grab`, `gseq`,
+/// `rec` frames, `gq`, `tweak grab`, the picture of `tweak final`), as [`run`] does: the app has
+/// no command for it, so a caller that relays commands to it runs these on a client of its own
+/// ([`Client::routed`]).
+pub fn client_side(argv: &[String]) -> bool {
+    let (words, _) = split_args(argv);
+    match (words.first().map(String::as_str), words.get(1).map(String::as_str)) {
+        (Some("grab" | "gseq" | "gq"), _) | (Some("tweak"), Some("grab" | "final")) => true,
+        (Some("rec"), s) => !matches!(s, Some("save" | "status" | "mark" | "on" | "off")),
+        _ => false,
+    }
+}
+
+fn run_inner(client: &Client, argv: &[String], each: &mut dyn FnMut(&str) -> bool, want_end: bool) -> Result<(bool, Option<String>), Error> {
+    let (words, kv) = split_args(argv);
+    let first = words.first().map(String::as_str).unwrap_or("help");
+    let second = words.get(1).map(String::as_str);
+    let reply = match (first, second) {
+        ("grab", _) | ("tweak", Some("grab")) => grab(client, &kv),
+        ("gseq", _) => gseq(client, &kv),
+        // `rec save|status|mark|on|off` is the flight recorder (an app command); bare `rec` records frames
+        ("rec", s) if !matches!(s, Some("save" | "status" | "mark" | "on" | "off")) => rec(client, &kv),
+        ("gq", _) => gq(client, &kv),
+        ("tweak", Some("final")) => return tweak_final(client, &words, &kv, each),
+        ("tools" | "call", _) => {
+            if let Err(e) = crate::params::validate(kv.iter().map(|(k, _)| k.as_str()), "") {
+                return Ok((emit(Err(e), each), None));
+            }
+            return match app_request_of(&words.join(" ")) {
+                Some(Ok(request)) => app_request(client, &request, each),
+                Some(Err(usage)) => Ok((emit(Err(usage), each), None)),
+                None => unreachable!("tools and call are app requests"),
+            };
+        }
+        _ => return forward(client, &words, &kv, each),
+    };
+    let err = emit(reply, each);
+    let end = if want_end && first != "gq" { ask_end(client, "ping") } else { None };
+    Ok((err, end))
+}
+
+fn emit(reply: Result<String, String>, each: &mut dyn FnMut(&str) -> bool) -> bool {
+    match reply {
+        Ok(json) => {
+            each(&json);
+            json.starts_with("{\"err\":")
+        }
+        Err(msg) => {
+            each(&format!("{{\"err\":{}}}", crate::json_str(&msg)));
+            true
+        }
+    }
+}
+
+fn forward(client: &Client, words: &[String], kv: &[(String, String)], each: &mut dyn FnMut(&str) -> bool) -> Result<(bool, Option<String>), Error> {
+    let line = if words.is_empty() { "help".to_string() } else { request_line(words, kv) };
+    let mut err = false;
+    let mut lines = client.cmd(&line)?;
+    while let Some(l) = lines.next() {
+        let l = l?;
+        err |= l.starts_with("{\"err\":");
+        if !each(&l) {
+            break;
+        }
+    }
+    Ok((err, lines.end().map(str::to_string)))
+}
+
+/// One request of the `app` service (the app's AI tools): its answer lines, as they come. The
+/// channel's end is the end of the answer; dropping it early cancels a call.
+fn app_request(client: &Client, args: &str, each: &mut dyn FnMut(&str) -> bool) -> Result<(bool, Option<String>), Error> {
+    use crate::conn::{Event, CLOSE_LINK_LOST, CLOSE_NORMAL};
+    let ch = match client.open("app", args) {
+        Ok(ch) => ch,
+        Err(Error::Refused(_, why)) if why.starts_with("unsupported service") => {
+            return Ok((emit(Err("this process serves no AI tools (no `app` service)".into()), each), None));
+        }
+        Err(e) => return Err(e),
+    };
+    let mut err = false;
+    while let Some(ev) = ch.recv() {
+        match ev {
+            Event::Data(d) => {
+                for line in String::from_utf8_lossy(&d).lines().filter(|l| !l.is_empty()) {
+                    if !each(line) {
+                        return Ok((err, None));
+                    }
+                }
+            }
+            Event::Closed(CLOSE_NORMAL, _) => break,
+            Event::Closed(CLOSE_LINK_LOST, why) => return Err(Error::LinkLost(why)),
+            Event::Closed(_, why) => {
+                err = true;
+                each(&format!("{{\"err\":{}}}", crate::json_str(&why)));
+                break;
+            }
+            Event::Opened(_) => {}
+        }
+    }
+    Ok((err, None))
+}
+
+/// The end line of a command's answer.
+fn ask_end(client: &Client, line: &str) -> Option<String> {
+    let mut lines = client.cmd(line).ok()?;
+    for l in lines.by_ref() {
+        l.ok()?;
+    }
+    lines.end().map(str::to_string)
+}
+
+/// The one answer line of a command (the first line), for the commands this module chains.
+fn ask_one(client: &Client, line: &str) -> Result<String, String> {
+    let mut lines = client.cmd(line).map_err(|e| e.to_string())?;
+    let first = lines.next().transpose().map_err(|e| e.to_string())?.unwrap_or_default();
+    for l in lines {
+        l.map_err(|e| e.to_string())?;
+    }
+    Ok(first)
+}
+
+fn window_of(kv: &[(String, String)]) -> Option<usize> {
+    get(kv, &["w", "window"]).and_then(|v| v.parse().ok())
+}
+
+fn scale_of(kv: &[(String, String)]) -> f64 {
+    get(kv, &["scale"]).and_then(|v| v.parse().ok()).unwrap_or(1.0)
+}
+
+/// `$TMPDIR/makepad-remote/<app>-<pid>/`, created.
+fn grab_dir(client: &Client) -> Result<PathBuf, String> {
+    let ping = ask_one(client, "ping").unwrap_or_default();
+    let f = discovery::fields(&ping);
+    let field = |k: &str| f.iter().find(|x| x.0 == k).map(|x| x.1.clone());
+    let app = field("app").and_then(|r| discovery::string(r.as_bytes(), &mut 0)).unwrap_or_else(|| "app".into());
+    let name = match field("pid") {
+        Some(pid) => format!("{app}-{pid}"),
+        None => app,
+    };
+    // (a lease's scratch dir, which Windows' own temp dir does not follow: its holder fetches the file there)
+    let dir = std::env::var_os("TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from).join("makepad-remote").join(name);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("grab dir: {e}"))?;
+    Ok(dir)
+}
+
+/// Writes `png` as the next `grab-w<window>-<seq>[-f<frame>-p<patch>].png` of `dir` (the frame
+/// it was drawn in and the live patches applied by then, when the app says) and deletes the older
+/// ones past [`KEPT_PER_WINDOW`], except the paths in `pinned`.
+fn write_grab(dir: &Path, window: usize, png: &[u8], pinned: &[PathBuf], drawn: Option<(u64, u64)>) -> Result<PathBuf, String> {
+    let prefix = format!("grab-w{window}-");
+    let existing = |dir: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|d| d.flatten().map(|e| e.path()).filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix))).collect())
+            .unwrap_or_default()
+    };
+    let seq = |p: &Path| p.file_stem().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix(&prefix)).and_then(|n| n.split('-').next()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+    let tag = drawn.map_or(String::new(), |(frame, patch)| format!("-f{frame}-p{patch}"));
+    let mut next = existing(dir).iter().map(|p| seq(p)).max().unwrap_or(0) + 1;
+    let path = loop {
+        let path = dir.join(format!("{prefix}{next:05}{tag}.png"));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => break path,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => next += 1,
+            Err(e) => return Err(format!("grab write: {e}")),
+        }
+    };
+    std::fs::write(&path, png).map_err(|e| format!("grab write: {e}"))?;
+    let mut mine: Vec<PathBuf> = existing(dir).into_iter().filter(|p| !pinned.contains(p)).collect();
+    if mine.len() > KEPT_PER_WINDOW {
+        mine.sort();
+        let drop = mine.len() - KEPT_PER_WINDOW;
+        for old in mine.into_iter().take(drop) {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+    Ok(path)
+}
+
+/// The frame a record was drawn in and the live patches applied by then, when the app says.
+fn drawn(r: &Record) -> Option<(u64, u64)> {
+    Some((r.num("frame")? as u64, r.num("patch")? as u64))
+}
+
+/// `{"png":path,"w":window,"sz":[w,h],"capture_ms":..,"encode_ms":..,"capture_kind":..[,"frame":n,"patch":n]}`
+fn grab_json(r: &Record, path: &Path) -> String {
+    format!(
+        "{{\"png\":{},\"w\":{},\"sz\":[{},{}],\"capture_ms\":{:.3},\"encode_ms\":{:.3},\"capture_kind\":{}{}}}",
+        crate::json_str(&path.display().to_string()),
+        r.num("window").unwrap_or(0.0),
+        r.num("w").unwrap_or(0.0),
+        r.num("h").unwrap_or(0.0),
+        r.num("capture_ms").unwrap_or(0.0),
+        r.num("encode_ms").unwrap_or(0.0),
+        crate::json_str(&r.text("capture_kind").unwrap_or_default()),
+        drawn(r).map_or(String::new(), |(frame, patch)| format!(",\"frame\":{frame},\"patch\":{patch}")),
+    )
+}
+
+/// One frame of `window`, written to `out` or the next file of the grab folder.
+fn grab_one(client: &Client, window: Option<usize>, scale: f64, out: Option<&str>) -> Result<(Record, PathBuf), String> {
+    let req = frames::Request { window, scale: Some(scale), raw: false, codec: None, n: Some(1), fps: None, cap: false };
+    let mut got = None;
+    frames::fetch(client, &req, &mut |r| {
+        got = Some(r);
+        Ok(())
+    })?;
+    let record = got.ok_or("the app sent no frame")?;
+    let path = match out {
+        Some(file) => {
+            std::fs::write(file, &record.bytes).map_err(|e| format!("grab write: {e}"))?;
+            PathBuf::from(file)
+        }
+        None => write_grab(&grab_dir(client)?, record.num("window").unwrap_or(0.0) as usize, &record.bytes, &[], drawn(&record))?,
+    };
+    Ok((record, path))
+}
+
+fn grab(client: &Client, kv: &[(String, String)]) -> Result<String, String> {
+    crate::params::validate(kv.iter().map(|(k, _)| k.as_str()), crate::params::GRAB)?;
+    let (record, path) = grab_one(client, window_of(kv), scale_of(kv), get(kv, &["out"]))?;
+    Ok(grab_json(&record, &path))
+}
+
+/// `rec [out=DIR] [seconds=5] [fps=30] [codec=png|raw] [w=ID]`: capture by streaming. The app reads every
+/// presented frame back and sends it here; this side writes `frame_<slot>.png` (or `.rgba`) into DIR and
+/// counts the slots that never arrived, so a capture is checkable (`frames`, `missing`) and needs no
+/// video encoder on the device. Encode the folder to a video with any encoder.
+fn rec(client: &Client, kv: &[(String, String)]) -> Result<String, String> {
+    crate::params::validate(kv.iter().map(|(k, _)| k.as_str()), crate::params::REC)?;
+    let seconds: f64 = get(kv, &["seconds", "s"]).unwrap_or("5").parse().map_err(|_| "rec seconds must be a number".to_string())?;
+    let fps: f64 = get(kv, &["fps"]).unwrap_or("30").parse().map_err(|_| "rec fps must be a number".to_string())?;
+    let codec = get(kv, &["codec"]).unwrap_or("rle");
+    if !matches!(codec, "rle" | "png" | "raw") { return Err("rec codec must be rle, png or raw".into()); }
+    let raw = codec == "raw";
+    let dir = match get(kv, &["out"]) {
+        Some(d) => { std::fs::create_dir_all(d).map_err(|e| format!("rec out: {e}"))?; PathBuf::from(d) }
+        None => grab_dir(client)?,
+    };
+    let req = frames::Request { window: window_of(kv), scale: Some(get(kv, &["scale"]).and_then(|v| v.parse().ok()).unwrap_or(0.5)), raw, codec: (codec == "rle").then_some("rle"), n: None, fps: Some(fps), cap: true };
+    let started = std::time::Instant::now();
+    let (mut count, mut first, mut last, mut size, mut dropped) = (0u64, None::<u64>, 0u64, (0u32, 0u32), 0u64);
+    let (mut t_first, mut t_last) = (None::<f64>, 0f64);
+    let result = frames::fetch(client, &req, &mut |r| {
+        let slot = r.num("seq").unwrap_or(0.0) as u64;
+        first.get_or_insert(slot);
+        last = slot;
+        size = (r.num("w").unwrap_or(0.0) as u32, r.num("h").unwrap_or(0.0) as u32);
+        dropped = r.num("dropped").unwrap_or(0.0) as u64;
+        let t = r.num("t_ns").unwrap_or(0.0);
+        t_first.get_or_insert(t);
+        t_last = t;
+        let (name, bytes) = match codec {
+            "rle" => (format!("frame_{slot:06}.bmp"), rle_to_bmp(size.0, size.1, &r.bytes)?),
+            "raw" => (format!("frame_{slot:06}.rgba"), r.bytes.clone()),
+            _ => (format!("frame_{slot:06}.png"), r.bytes.clone()),
+        };
+        std::fs::write(dir.join(name), bytes).map_err(|e| format!("rec write: {e}"))?;
+        count += 1;
+        if started.elapsed().as_secs_f64() >= seconds { return Err("\u{0}done".into()); }
+        Ok(())
+    });
+    match result {
+        Ok(()) => {}
+        Err(e) if e == "\u{0}done" => {}
+        Err(e) => return Err(format!("rec: {e}")),
+    }
+    let span = first.map_or(0, |f| last - f + 1);
+    Ok(format!("{{\"dir\":{},\"frames\":{count},\"missing\":{},\"slots\":{span},\"fps\":{fps},\"sz\":[{},{}],\"device_dropped\":{dropped},\"device_ms\":{:.0}}}", crate::json_str(&dir.display().to_string()), span.saturating_sub(count), size.0, size.1, (t_last - t_first.unwrap_or(t_last)) / 1e6))
+}
+
+/// Run-length RGBA (see the app's `rle_encode`) to a 32-bit top-down BMP.
+fn rle_to_bmp(w: u32, h: u32, rle: &[u8]) -> Result<Vec<u8>, String> {
+    let mut px = Vec::with_capacity(w as usize * h as usize * 4);
+    let mut i = 0;
+    while i + 6 <= rle.len() {
+        let run = u16::from_le_bytes([rle[i], rle[i + 1]]) as usize;
+        let (r, g, b, a) = (rle[i + 2], rle[i + 3], rle[i + 4], rle[i + 5]);
+        for _ in 0..run { px.extend_from_slice(&[b, g, r, a]); }
+        i += 6;
+    }
+    if px.len() != w as usize * h as usize * 4 { return Err(format!("rec: a frame decoded to {} bytes, expected {}", px.len(), w as usize * h as usize * 4)); }
+    let mut out = Vec::with_capacity(54 + px.len());
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((54 + px.len()) as u32).to_le_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    out.extend_from_slice(&(-(h as i32)).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(&[0u8; 24]);
+    out.extend_from_slice(&px);
+    Ok(out)
+}
+
+fn gseq(client: &Client, kv: &[(String, String)]) -> Result<String, String> {
+    crate::params::validate(kv.iter().map(|(k, _)| k.as_str()), crate::params::GSEQ)?;
+    let n = match get(kv, &["n"]).unwrap_or("8").parse::<usize>() {
+        Ok(n @ 1..=64) => n,
+        _ => return Err("gseq n must be an integer in 1..=64".into()),
+    };
+    let every_ms = match get(kv, &["every_ms"]).unwrap_or("50").parse::<u64>() {
+        Ok(ms @ 8..=60_000) if ms * (n as u64 - 1) <= 60_000 => ms,
+        _ => return Err("gseq every_ms must be 8..=60000; total cadence span must not exceed 60s".into()),
+    };
+    let dir = match get(kv, &["out"]) {
+        Some(d) => {
+            std::fs::create_dir_all(d).map_err(|e| format!("gseq out: {e}"))?;
+            PathBuf::from(d)
+        }
+        None => grab_dir(client)?,
+    };
+    let req = frames::Request { window: window_of(kv), scale: Some(scale_of(kv)), raw: false, codec: None, n: Some(n), fps: Some(1000.0 / every_ms as f64), cap: false };
+    let (mut paths, mut frame_json, mut pinned) = (Vec::new(), Vec::new(), Vec::new());
+    frames::fetch(client, &req, &mut |r| {
+        let index = frame_json.len();
+        let path = write_grab(&dir, r.num("window").unwrap_or(0.0) as usize, &r.bytes, &pinned, drawn(&r))?;
+        paths.push(crate::json_str(&path.display().to_string()));
+        let mut frame = grab_json(&r, &path);
+        frame.pop();
+        frame.push_str(&format!(",\"scheduled_ms\":{},\"pixels_ms\":{:.3}}}", index as u64 * every_ms, index as f64 * every_ms as f64 + r.num("capture_ms").unwrap_or(0.0)));
+        frame_json.push(frame);
+        pinned.push(path);
+        Ok(())
+    })
+    .map_err(|e| format!("gseq frame {}: {e}", frame_json.len()))?;
+    Ok(format!("{{\"png\":[{}],\"n\":{n},\"every_ms\":{every_ms},\"frames\":[{}]}}", paths.join(","), frame_json.join(",")))
+}
+
+/// The windows of a `status` answer (`"w":[{"i":ID,"pass_dpi":N,...},...]`): (id, pass dpi).
+fn windows_of(status: &str) -> Vec<(usize, f64)> {
+    let Some(start) = status.find("\"w\":[") else { return Vec::new() };
+    let b = status.as_bytes();
+    let (mut i, mut depth, mut windows) = (start + 5, 1i32, Vec::new());
+    while i < b.len() && depth > 0 {
+        match b[i] {
+            b'"' => {
+                // a string: skip it (it may hold anything)
+                let begin = i;
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                // a key directly inside a window object (depth 2)
+                if depth == 2 && b.get(i + 1) == Some(&b':') {
+                    let number: String = status[i + 2..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+                    match &status[begin..=i.min(b.len() - 1)] {
+                        "\"i\"" => {
+                            if let Ok(id) = number.parse() {
+                                windows.push((id, 0.0));
+                            }
+                        }
+                        "\"pass_dpi\"" => {
+                            if let (Some(window), Ok(dpi)) = (windows.last_mut(), number.parse()) {
+                                window.1 = dpi;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    windows
+}
+
+/// The ids of the windows of a `status` answer that have drawn: one that never did (a window
+/// only a headset's frames go to) has no frame to grab.
+pub fn drawn_window_ids(status: &str) -> Vec<usize> {
+    windows_of(status).into_iter().filter(|(_, dpi)| *dpi > 0.0).map(|(id, _)| id).collect()
+}
+
+/// A frame of every window (or `w=`), then `quit`: the last call of a session.
+fn gq(client: &Client, kv: &[(String, String)]) -> Result<String, String> {
+    crate::params::validate(kv.iter().map(|(k, _)| k.as_str()), crate::params::GQ)?;
+    let scale = scale_of(kv);
+    let targets = match window_of(kv) {
+        Some(w) => vec![w],
+        None => drawn_window_ids(&ask_one(client, "status").unwrap_or_default()),
+    };
+    let (mut paths, mut problems) = (Vec::new(), Vec::new());
+    for window in targets {
+        match grab_one(client, Some(window), scale, None) {
+            Ok((_, path)) => paths.push(crate::json_str(&path.display().to_string())),
+            Err(msg) => problems.push(format!("w{window}: {msg}")),
+        }
+    }
+    // Capture failure still permits cleanup, but human intervention does not.
+    // a driver that pinned the user sequence passes it on: quit is refused once the person intervened
+    let quit = match get(kv, &["if_user_seq"]) {
+        Some(seq) => request_line(&["quit".to_string()], &[("if_user_seq".to_string(), seq.to_string())]),
+        None => "quit".to_string(),
+    };
+    let reply = ask_one(client, &quit).unwrap_or_else(|e| format!("{{\"err\":{}}}", crate::json_str(&e)));
+    if reply.starts_with("{\"err\":") {
+        // the person intervened (or the app refused): nothing was quit
+        return Ok(reply);
+    }
+    let mut out = format!("{{\"png\":[{}],\"quit\":{}", paths.join(","), if reply.starts_with("{\"ok\":1") { 1 } else { 0 });
+    if !problems.is_empty() {
+        out.push_str(&format!(",\"err\":{}", crate::json_str(&problems.join("; "))));
+    }
+    out.push('}');
+    Ok(out)
+}
+
+/// The app's `tweak final`; when it says the user drew (`"drew":1`) a frame of the window is
+/// written too and named in the same JSON.
+fn tweak_final(client: &Client, words: &[String], kv: &[(String, String)], each: &mut dyn FnMut(&str) -> bool) -> Result<(bool, Option<String>), Error> {
+    let mut lines = Vec::new();
+    let mut err = false;
+    let mut answer = client.cmd(&request_line(words, kv))?;
+    while let Some(l) = answer.next() {
+        let l = l?;
+        err |= l.starts_with("{\"err\":");
+        lines.push(l);
+    }
+    let end = answer.end().map(str::to_string);
+    if let Some(json) = lines.first_mut() {
+        if json.contains("\"drew\":1") && json.ends_with('}') {
+            json.pop();
+            match grab_one(client, window_of(kv), scale_of(kv), None) {
+                Ok((_, path)) => json.push_str(&format!(",\"png\":{}}}", crate::json_str(&path.display().to_string()))),
+                Err(msg) => json.push_str(&format!(",\"png_err\":{}}}", crate::json_str(&msg))),
+            }
+        }
+    }
+    for l in &lines {
+        if !each(l) {
+            break;
+        }
+    }
+    Ok((err, end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{client_side, typed_line};
+
+    fn words(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn typed_code_keeps_its_equals_signs() {
+        assert_eq!(
+            typed_line(&words("probe add f fn probe(x: u32) { let y = x; match y { 0 => (), _ => () } } mutate=1")),
+            r#"{"cmd":"probe add f","mutate":"1","code":"fn probe(x: u32) { let y = x; match y { 0 => (), _ => () } }"}"#
+        );
+        assert_eq!(typed_line(&words("eval mutate=1 a == b")), r#"{"cmd":"eval","mutate":"1","expr":"a == b"}"#);
+        assert_eq!(typed_line(&words("vm roots top=12")), "vm roots top=12");
+        let spaced = ["ui".to_string(), "find".to_string(), "q=Save as".to_string(), "nth=1".to_string()];
+        assert_eq!(typed_line(&spaced), r#"{"cmd":"ui find","q":"Save as","nth":"1"}"#);
+    }
+
+    #[test]
+    fn the_commands_read_from_frames_are_the_clients_own() {
+        for line in ["grab out=a.png", "grab w=1 scale=0.5", "gseq n=4", "gq", "rec", "rec n=30", "tweak grab", "tweak final x=1"] {
+            assert!(client_side(&words(line)), "{line} is answered on the client");
+        }
+        for line in ["rec save", "rec status", "rec mark x", "ui tree", "tweak set x=1", "session", "tools", ""] {
+            assert!(!client_side(&words(line)), "{line} is the app's own");
+        }
+    }
+}
