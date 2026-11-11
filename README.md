@@ -1,26 +1,97 @@
 # Relax
 
-**A live compiler and JIT runtime for Rust, written in Rust.**
+### Rust without the wait.
 
-Relax runs a Cargo package straight from its source. It doesn't use rustc, LLVM or a linker. It
-parses, expands, type-checks and borrow-checks your crates itself, compiles each function to machine
-code the first time it is called, keeps optimising the hot ones in the background, and swaps in new
-code while the program keeps running when you edit a file.
+**Relax is a live compiler and JIT runtime for Rust, written in Rust.** It runs your Cargo package
+straight from source: no rustc, no LLVM, no linker in the loop. It checks your code, compiles each
+function the moment it is first called, optimises the hot ones while your program runs, and patches
+new code into the running process when you save a file.
+
+Rust gives you speed and safety, and charges for them in compile times. Relax takes the compile out of
+the loop. You keep the language, the crates, the type system and the borrow checker, and you lose the
+wait.
 
 <table>
 <tr>
-<td align="center"><b>438k</b><br/>lines of Rust: the whole compiler and runtime</td>
-<td align="center"><b>0</b><br/>crates.io dependencies</td>
-<td align="center"><b>2</b><br/>native back ends: x86-64 and AArch64</td>
-<td align="center"><b>134k</b><br/>lines of <code>core</code> / <code>alloc</code> / <code>std</code> it compiles itself</td>
+<td align="center"><h2>13 s</h2>to the first frame of a large 3D game, cold, from source.<br/>A clean <code>cargo build</code> takes about 3 minutes.</td>
+<td align="center"><h2>2.2 s</h2>from saving a file to 92 tests re-run against the patched code</td>
+<td align="center"><h2>~0.1 s</h2>to relaunch an unchanged program</td>
 </tr>
 <tr>
-<td align="center"><b>2.8M</b> lines<br/>parsed in <b>4 s</b></td>
-<td align="center"><b>1.06×</b><br/>rustc release (LLVM) run time on its benchmark chart</td>
-<td align="center"><b>~0.1 s</b><br/>warm relaunch of an unchanged program</td>
-<td align="center"><b>96</b><br/>end-to-end test packages</td>
+<td align="center"><h2>1.06×</h2>the run time of rustc release (LLVM) on its benchmark chart, from a JIT</td>
+<td align="center"><h2>2.8M</h2>lines of Rust parsed in 4 s</td>
+<td align="center"><h2>0</h2>crates.io dependencies. 438k lines, all of it ours.</td>
 </tr>
 </table>
+
+---
+
+## Why this changes Rust
+
+**The edit-compile-run loop is Rust's biggest tax.** A change to one function rebuilds crates,
+relinks binaries and restarts your program, so you lose its state and your flow. On a large app that
+is minutes, many times a day.
+
+**Relax replaces the loop with a live program.**
+
+- **It starts from source, now.** No native build stands between you and `main`. A small app boots
+  cold in about 3 s; a large 3D game reaches its first frame in about 13 s, where a clean release
+  build takes about 3 minutes.
+- **Saving is the build.** Only the functions whose source changed are rechecked and recompiled, and
+  they are swapped into the running process. The program keeps its state, windows and connections.
+- **It is fast where it counts.** Code starts on a threaded interpreter and climbs to O1 and O3 in the
+  background while it runs. On its benchmark chart, optimised Relax code runs at 1.06× rustc release
+  time. On the hardest workload we track it is 1.24×, and that gap is being closed.
+- **It is still Rust.** Ordinary crates, from path, git, crates.io and vendored sources, with their
+  macros, procedural macros included. Every crate is type-checked and borrow-checked before its first
+  call: Relax never runs code it hasn't checked.
+- **It never hands you stale code.** Every cached result is keyed by the hashes of its inputs. A warm
+  start recompiles nothing, and a cache hit is exactly what a fresh compile would produce.
+
+**Built for machines as much as people.** An AI agent can't feel a slow build, but it pays for every
+one: in tokens, wall-clock and context. Relax turns "edit, wait, look" into "edit, look", and every
+phase reports what it is doing, so an agent can always ask the runtime what happened and why.
+
+---
+
+## Relax at work: an AI development loop that stays hot
+
+[Makepad](https://github.com/makepad/makepad) builds its apps with many AI agents working in parallel,
+each in its own lane, and Relax is what makes that loop fast. Makepad's dev hub, **devhub**, runs the
+fleet of build and test machines around Relax so that nothing an agent touches is ever cold.
+
+```mermaid
+flowchart LR
+    A["AI agent<br/>edits a file"] -->|"sync, ~50-200 ms"| B["devhub<br/>routes to a warm box"]
+    B --> C["Live Relax session<br/>patches only what changed"]
+    C --> D["Tests re-run<br/>verdict in seconds"]
+    C --> E["App frame<br/>grabbed as a PNG"]
+    D --> A
+    E --> A
+    C -->|"flight recorder"| F["why it was slow,<br/>what it compiled"]
+    F --> A
+```
+
+**What keeps it hot**
+
+- **Live sessions per lane.** Each agent's app or test run stays alive under Relax on a pool machine.
+  A save syncs to it in tens of milliseconds and patches the running process. No rebuild, no relaunch.
+- **Tests as a live verdict.** The same warm process re-runs the affected tests after each patch: 92
+  tests came back 2.2 s after the save that changed them.
+- **Warm caches everywhere.** Each machine keeps a warm Relax cache at the tip of the main branch and
+  refreshes it as changes land, so a new lane or a fresh worker starts warm, not cold.
+- **Restart in place.** When an edit changes a type's layout in a way that can't be patched, the
+  session restarts itself in place and keeps going. The agent sees a line in its log, not an error.
+- **No native builds in the loop.** devhub sends iteration and pre-landing checks to Relax. Native
+  builds are kept for baselines and timed benchmarks, and the scheduler counts every native build
+  that slips through, per lane.
+- **Measured routing.** Jobs are sized by their measured times. Small jobs go to "hot" machines with
+  warm sessions, and big ones to the pool, so an agent's quick check never queues behind a long build.
+- **Answers, not logs.** When a frame hitches, Relax's flight recorder says which thread waited, on
+  what, and which function was compiling. Agents use it to find their own stalls.
+
+**In practice:** nine agent lanes run side by side, devhub handles more than 300 build and test jobs an
+hour, and dozens of changes land every day, each checked under Relax before it merges.
 
 ---
 
@@ -28,22 +99,22 @@ code while the program keeps running when you edit a file.
 
 | | |
 | --- | --- |
-| **Boots from source** | Reads `Cargo.toml`, resolves the crate graph (path, git, registry and vendored crates) and starts `main` with no native build of your code. A small app starts cold in about 3 s; a large 3D game reaches its first frame cold in about 13 s. |
-| **Checks before it runs** | Your crates are parsed, macro-expanded, type-checked and borrow-checked before the first call. Relax never runs code it hasn't checked. |
+| **Boots from source** | Reads `Cargo.toml`, resolves the crate graph (path, git, registry and vendored crates) and starts `main` with no native build of your code. |
+| **Checks before it runs** | Your crates are parsed, macro-expanded, type-checked and borrow-checked before the first call. |
 | **Compiles lazily, in tiers** | A function is compiled the first time it is called. Hot functions move up in the background: threaded interpreter → O1 → O3. `#[relax(O2)]` / `#[relax(O3)]` ask for a level ahead of the first call; under rustc the attribute does nothing. |
-| **Live edits** | Save a file and the functions whose source changed are rechecked, recompiled and swapped in while the program runs. Code already handed out stays valid, and a change that can't be swapped restarts the program in place. |
-| **Warm caches** | Every result is cached under the hashes of its inputs. A second start of an unchanged package recompiles nothing, and a cache can never hand back stale code. |
+| **Live edits** | Save a file and the functions whose source changed are rechecked, recompiled and swapped in while the program runs. Code already handed out stays valid. A change that can't be swapped restarts the program in place. |
+| **Warm caches** | Every result is cached under the hashes of its inputs. A second start of an unchanged package recompiles nothing. |
 | **Procedural macros** | Proc macros run too: macros that match a natively linked build run natively, and the rest run on the JIT. |
-| **Its own std** | `core`, `alloc` and `std` are compiled from source by Relax itself. |
+| **Its own std** | `core`, `alloc` and `std` (134k lines) are compiled from source by Relax itself. |
 | **Native interop** | Crates that must stay native (OS layers, GPU, audio) export an interface with `#[relax_api]`. JIT code calls them through the C ABI planner, with per-thread heap routing across the boundary. |
-| **Built to be inspected** | Compile phases, stalls and tier changes go to a flight recorder, with hitch events and compile profilers, so the runtime can always say what it is doing and why. |
+| **Built to be inspected** | Compile phases, stalls and tier changes go to a flight recorder, with hitch events and compile profilers. |
 
 ---
 
 ## Architecture
 
 Relax is a stack of layers. Each layer builds only on the ones below it and re-exports them, so every
-module is `crate::<module>` at every layer. Each layer is its own crate, so they compile in parallel
+module is `crate::<module>` at every layer. Each layer is its own crate, so they compile in parallel,
 and a change in an upper layer never rebuilds the ones below.
 
 ```mermaid
@@ -72,7 +143,7 @@ flowchart TB
         PM["proc-macro host"]
     end
 
-    API["relax_api<br/>#[relax_api] native crates"]
+    API["relax_api<br/>native crates"]
 
     SRC --> LEX --> BASE --> SES --> FE --> TY --> CG --> BE --> JIT
     PM --> FE
@@ -105,9 +176,9 @@ sequenceDiagram
     participant TY as Types layer
     participant CG as Codegen + backend
 
-    Note over RT,TY: before the first call: every crate of the program is type-checked
+    Note over RT,TY: before the first call, every crate of the program is type-checked
     App->>RT: first call of fn f
-    RT->>CG: compile f (interpreter / O1)
+    RT->>CG: compile f (interpreter or O1)
     CG-->>RT: machine code, published
     RT-->>App: call proceeds
     loop while f is hot
@@ -125,13 +196,13 @@ sequenceDiagram
 ### Design rules
 
 - **Checked, then run.** Code is type-checked before it is executed; nothing runs unchecked.
-- **Never stale.** Every cached result is keyed by the hashes of its inputs. A cache hit is the code
-  a fresh compile would produce, or there is no hit.
+- **Never stale.** Every cached result is keyed by the hashes of its inputs. A cache hit is the code a
+  fresh compile would produce, or there is no hit.
 - **Code only grows.** Published machine code is never freed or rewritten while it can still be on a
   stack; a swap publishes new code and redirects future calls.
 - **Lazy by default.** Nothing is compiled until it is needed, and optimisation runs in the background.
-- **Rust as written.** Relax compiles ordinary Rust crates, including their dependencies from
-  crates.io and git. `libs/relax/KNOWN_GAPS.md` lists what doesn't work yet.
+- **Rust as written.** Relax compiles ordinary Rust crates, including their dependencies from crates.io
+  and git. `libs/relax/KNOWN_GAPS.md` lists what doesn't work yet.
 - **Inspectable.** Every phase reports what it is doing; a stall can always be explained from its record.
 
 ---
@@ -153,7 +224,7 @@ Cargo.toml                              the workspace
 libs/relax/
   lex/ base/ session/ front/ types/     front end and type system
   codegen/ backend/                     middle end and machine code
-  compiler/                             runtime, std (compiler/std), tests, benches
+  compiler/                             runtime, std (compiler/std), 96 end-to-end test packages, benches
   attr/ native_macros/                  #[relax(..)] and native proc macros
   KNOWN_GAPS.md                         what isn't supported yet
 libs/relax_api/                         #[relax_api] and per-thread heap routing
