@@ -11,18 +11,17 @@ Rust gives you speed and safety, and charges for them in compile times. Relax ta
 the loop. You keep the language, the crates, the type system and the borrow checker, and you lose the
 wait.
 
-<table>
-<tr>
-<td align="center"><h2>13 s</h2>to the first frame of a large 3D game, cold, from source.<br/>A clean <code>cargo build</code> takes about 3 minutes.</td>
-<td align="center"><h2>2.2 s</h2>from saving a file to 92 tests re-run against the patched code</td>
-<td align="center"><h2>~0.1 s</h2>to relaunch an unchanged program</td>
-</tr>
-<tr>
-<td align="center"><h2>1.06×</h2>the run time of rustc release (LLVM) on its benchmark chart, from a JIT</td>
-<td align="center"><h2>2.8M</h2>lines of Rust parsed in 4 s</td>
-<td align="center"><h2>0</h2>crates.io dependencies. 438k lines, all of it ours.</td>
-</tr>
-</table>
+## Relax vs rustc
+
+| | rustc + Cargo | **Relax** |
+| --- | --- | --- |
+| **Large 3D game, clean checkout → first frame** | ~3 min build, then start | **13 s**, straight from source |
+| **Change one function in a running program** | rebuild, relink, restart: program state lost | **patched into the running process**: state kept |
+| **Save a file → 92 tests re-run** | rebuild the test binary first | **2.2 s** after the save |
+| **Relaunch an unchanged program** | no-op build check, then start | **~0.1 s** from a warm cache |
+| **Speed of optimised code** | 1.00× (LLVM release) | **1.06×** on the benchmark chart (1.24× on the hardest workload we track) |
+| **Type- and borrow-checked before it runs** | yes | **yes** |
+| **Needs** | rustc, LLVM, a linker | **Relax**, one Rust library (438k lines, 0 crates.io dependencies) |
 
 ---
 
