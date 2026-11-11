@@ -13,10 +13,11 @@ running process when you save a file.
 
 | | rustc + Cargo | **Relax** |
 | --- | --- | --- |
-| **Large 3D game, clean checkout → first frame** | ~3 min build, then start | **13 s**, straight from source |
+| **Large 3D game, clean checkout → first frame** | ~3 min build, then start | **11 s** on an M4 MacBook, straight from source |
+| **Same game, second run → first frame** | start the built binary | **1.15 s** on an M4 MacBook, nothing recompiled |
 | **Change one function in a running program** | rebuild, relink, restart: program state lost | **patched into the running process**: state kept |
 | **Save a file → 92 tests re-run** | rebuild the test binary first | **2.2 s** after the save |
-| **Relaunch an unchanged program** | no-op build check, then start | **~0.1 s** from a warm cache |
+| **Small app, cold → first frame** | build it first | **3.7 s** cold, **0.41 s** warm (M4 MacBook) |
 | **Speed of optimised code** | 1.00× (LLVM, `--release` for the native CPU) | **1.14–1.26×** on real workloads; 2.3× on dense numeric loops, which it doesn't vectorise yet ([details](#where-llvm-still-wins)) |
 | **Type- and borrow-checked before it runs** | yes | **yes** |
 | **Needs** | rustc, LLVM, a linker | **Relax**, one Rust library (438k lines, 0 crates.io dependencies) |
@@ -46,7 +47,7 @@ safety and drops the charge.
 
 | | With rustc | **With Relax** |
 | --- | --- | --- |
-| **Getting started** | Build everything first. On a large app, minutes pass before `main` runs. | **Start from source now.** A small app boots cold in about 3 s; a large 3D game reaches its first frame in about 13 s. |
+| **Getting started** | Build everything first. On a large app, minutes pass before `main` runs. | **Start from source now.** On an M4 MacBook a small app shows its first frame 3.7 s after a cold start, and a large 3D game in 11 s. Run them again and it's 0.41 s and 1.15 s. |
 | **Making a change** | Rebuild the crate and everything that depends on it, relink, restart, and get back to where you were. | **Saving is the build.** Only the functions you changed are rechecked and recompiled, and they're swapped into the running program, which keeps its state, windows and connections. |
 | **Run-time speed** | Fast, after a long optimised build. | **Fast, while it runs.** Code starts on an interpreter and climbs to O1 and O3 in the background. On real workloads, optimised Relax code runs within 1.14–1.26× of rustc `--release` built for the native CPU, and the gap is closing every week. |
 | **Safety** | Everything type- and borrow-checked. | **The same.** Relax never runs code it hasn't checked. |
