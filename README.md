@@ -118,7 +118,7 @@ sequenceDiagram
     RT->>TY: recheck what changed
     TY-->>RT: ok
     RT->>CG: recompile f
-    CG-->>RT: new code; old code stays valid
+    CG-->>RT: new code, the old code stays valid
     RT-->>App: next call runs the new f
 ```
 
