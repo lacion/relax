@@ -2863,6 +2863,65 @@ fn first_of(nodes: &[MNode]) -> (Vec<Follow>, bool) {
     (out, true)
 }
 
+/// The readings `match_arm` goes back to before it gives an arm up: arguments nothing matches can
+/// be read in ever more ways (rustc's threads grow so too).
+const MATCH_STEPS: u32 = 1 << 24;
+
+/// One place in a flattened matcher (rustc_expand mbe/macro_parser.rs `MatcherLoc`).
+enum Loc<'a> {
+    Tok(&'a MTok),
+    Var(&'a str, Frag),
+    /// a group's opening token; its content follows, then `Close`
+    Open(&'a MTok),
+    Close,
+    /// `$(`: its content follows (`inner`), then its `RepEnd` at `end`
+    RepStart { end: usize, op: u8, inner: &'a [MNode] },
+    /// `) sep op`: `first` is the place after its `RepStart`
+    RepEnd { first: usize, sep: Option<&'a MTok>, op: u8 },
+}
+
+fn flatten<'a>(nodes: &'a [MNode], out: &mut Vec<Loc<'a>>) {
+    for n in nodes {
+        match n {
+            MNode::Tok(t) => out.push(Loc::Tok(t)),
+            MNode::Var(name, f) => out.push(Loc::Var(name, *f)),
+            MNode::Group(open, _, inner) => {
+                out.push(Loc::Open(open));
+                flatten(inner, out);
+                out.push(Loc::Close);
+            }
+            MNode::Rep(inner, sep, op) => {
+                let start = out.len();
+                out.push(Loc::RepStart { end: 0, op: *op, inner });
+                flatten(inner, out);
+                let at = out.len();
+                if let Loc::RepStart { end, .. } = &mut out[start] { *end = at; }
+                out.push(Loc::RepEnd { first: start + 1, sep: sep.as_ref(), op: *op });
+            }
+        }
+    }
+}
+
+/// What a reading bound, in the order it met it (`match_arm`): a fragment, a repetition entered
+/// (its content, for the names it binds), an iteration of it begun, the repetition ended.
+enum Bound<'a> {
+    Var(&'a str, Bind),
+    Enter(&'a [MNode]),
+    Iter,
+    Exit,
+}
+
+/// A reading left for later (`match_arm`): where it goes on in the matcher and the tokens, and
+/// the state the reading that forked had there. It ends the repetition it stands after.
+struct Fork {
+    at: usize,
+    i: usize,
+    ends: Vec<usize>,
+    starts: Vec<usize>,
+    log: usize,
+    undo: usize,
+}
+
 fn follow_ok(frag: Frag, fol: &Follow, edition: u16) -> bool {
     // (a fragment follower is judged by its first tokens; only `tt` starts with anything)
     if let Follow::Frag(f) = fol {
@@ -3128,13 +3187,6 @@ impl<'a> Parser<'a> {
         i < hi && self.toks.at(i).kind == T::Not && i + 1 < hi && is_open(self.toks.at(i + 1).kind) && self.tok_close_of(i + 1, hi) == Some(hi - 1)
     }
 
-    fn match_seq(&mut self, nodes: &[MNode], i: &mut usize, end: usize, binds: &mut HashMap<String, Bind>) -> bool {
-        let undo = self.tok_undo.len();
-        let matched = self.match_seq_inner(nodes, i, end, binds);
-        if !matched { self.restore_match_tokens(undo); }
-        matched
-    }
-
     fn restore_match_tokens(&mut self, undo: usize) {
         while self.tok_undo.len() > undo {
             let (k, t) = self.tok_undo.pop().unwrap();
@@ -3142,74 +3194,156 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn match_seq_inner(&mut self, nodes: &[MNode], i: &mut usize, end: usize, binds: &mut HashMap<String, Bind>) -> bool {
-        for n in nodes {
-            match n {
-                MNode::Tok(m) => {
-                    if *i >= end || !self.mtok_eq(*i, m) {
-                        return false;
-                    }
-                    *i += 1;
+    /// Whether an arm's `matcher` matches the tokens [lo, hi); its fragments in `binds`.
+    ///
+    /// rustc_expand mbe/macro_parser.rs matches an arm as an NFA (`parse_tt`) over the flattened
+    /// matcher (`MatcherLoc`): a thread per way to read the arguments so far, all advanced a
+    /// token at a time. A repetition forks: where it starts, one thread enters it and one skips
+    /// it (`MatcherLoc::Sequence`); after an iteration, one ends it and one goes on, past the
+    /// separator when it has one (`SequenceKleeneOpNoSep`, `SequenceSep`). So in
+    /// `$( $x:ty $(,)? ),*` a `,` is read both as the inner `$(,)?` and as the separator, and the
+    /// thread the next token refuses dies. A fragment is parsed when its thread is the only one
+    /// left (`check_for_ambiguity`), so arguments an arm matches are matched in one way only.
+    ///
+    /// Here the same readings are followed one after the other over the same flattened matcher:
+    /// at each fork the one that goes on, with the other kept in `open` for when that one fails.
+    /// What rustc matches has one reading, and this finds it; where rustc reports an ambiguity
+    /// (two readings reach a fragment or the end) this takes the first. A loop, as rustc's: a
+    /// repetition's length is no depth of this thread's stack.
+    fn match_arm(&mut self, matcher: &[MNode], lo: usize, hi: usize, binds: &mut HashMap<String, Bind>) -> bool {
+        let mut locs = Vec::new();
+        flatten(matcher, &mut locs);
+        // the reading being followed: its place in the matcher and in the tokens, the closing
+        // tokens of the groups it is in, where the current iteration of each repetition it is
+        // in began, and what it bound so far
+        let (mut at, mut i) = (0usize, lo);
+        let mut ends: Vec<usize> = Vec::new();
+        let mut starts: Vec<usize> = Vec::new();
+        let mut log: Vec<Bound> = Vec::new();
+        // the readings left for later: each ends its repetition at `at` where the one followed went on
+        let mut open: Vec<Fork> = Vec::new();
+        let mut steps = MATCH_STEPS;
+        loop {
+            let end = ends.last().copied().unwrap_or(hi);
+            let matched = match locs.get(at) {
+                None => {
+                    if i == hi { break; }
+                    false
                 }
-                MNode::Group(open, _, inner) => {
-                    // rustc_expand mbe/macro_parser.rs: an interpolated expression
-                    // is an opaque nonterminal, not a written parenthesis group.
-                    if *i >= end || self.toks.at(*i).kind != open.kind
-                        || self.synth_parens.contains(&{ self.toks.at(*i).lo }) {
-                        return false;
-                    }
-                    let c = match self.tok_close_of(*i, end) {
-                        Some(c) => c,
-                        None => return false,
-                    };
-                    let mut j = *i + 1;
-                    if !self.match_seq(inner, &mut j, c, binds) || j != c {
-                        return false;
-                    }
-                    *i = c + 1;
+                Some(Loc::Tok(m)) => {
+                    let found = i < end && self.mtok_eq(i, m);
+                    if found { i += 1; at += 1; }
+                    found
                 }
-                MNode::Var(name, f) => match self.match_frag(*f, *i, end) {
+                Some(Loc::Var(name, f)) => match self.match_frag(*f, i, end) {
                     Some((e, taken, bare)) => {
-                        binds.insert(name.clone(), Bind::One(*i, e, *f, taken, bare));
-                        *i = e;
+                        log.push(Bound::Var(name, Bind::One(i, e, *f, taken, bare)));
+                        i = e;
+                        at += 1;
+                        true
                     }
-                    None => return false,
+                    None => false,
                 },
-                MNode::Rep(inner, sep, op) => {
-                    let mut names = Vec::new();
-                    vars_of(inner, &mut names);
-                    let mut iters: Vec<HashMap<String, Bind>> = Vec::new();
-                    loop {
-                        let start = *i;
-                        let mut j = *i;
-                        if !iters.is_empty() {
-                            if let Some(s) = sep {
-                                if j >= end || !self.mtok_eq(j, s) {
-                                    break;
-                                }
-                                j += 1;
+                // rustc_expand mbe/macro_parser.rs: an interpolated expression
+                // is an opaque nonterminal, not a written parenthesis group.
+                Some(Loc::Open(open)) => match (i < end && self.toks.at(i).kind == open.kind && !self.synth_parens.contains(&{ self.toks.at(i).lo }))
+                    .then(|| self.tok_close_of(i, end)).flatten() {
+                    Some(close) => {
+                        ends.push(close);
+                        i += 1;
+                        at += 1;
+                        true
+                    }
+                    None => false,
+                },
+                Some(Loc::Close) => {
+                    let closed = ends.last() == Some(&i);
+                    if closed { ends.pop(); i += 1; at += 1; }
+                    closed
+                }
+                Some(Loc::RepStart { end: rep_end, op, inner }) => {
+                    log.push(Bound::Enter(inner));
+                    // the reading that skips it (none of `+`), then the one that enters it
+                    if *op != b'+' {
+                        open.push(Fork { at: *rep_end + 1, i, ends: ends.clone(), starts: starts.clone(), log: log.len(), undo: self.tok_undo.len() });
+                    }
+                    starts.push(i);
+                    log.push(Bound::Iter);
+                    at += 1;
+                    true
+                }
+                Some(Loc::RepEnd { first, sep, op }) => {
+                    let start = starts.last().copied().unwrap_or(i);
+                    // (an iteration that matched nothing would repeat forever: it is none)
+                    if i == start {
+                        false
+                    } else {
+                        let next = match sep {
+                            _ if *op == b'?' => None,
+                            Some(s) => (i < end && self.mtok_eq(i, s)).then_some(i + 1),
+                            None => Some(i),
+                        };
+                        match next {
+                            // the reading that ends it here, then the one that goes on
+                            Some(next) => {
+                                let mut outer = starts.clone();
+                                outer.pop();
+                                open.push(Fork { at: at + 1, i, ends: ends.clone(), starts: outer, log: log.len(), undo: self.tok_undo.len() });
+                                if let Some(s) = starts.last_mut() { *s = i; }
+                                log.push(Bound::Iter);
+                                i = next;
+                                at = *first;
+                            }
+                            None => {
+                                starts.pop();
+                                log.push(Bound::Exit);
+                                at += 1;
                             }
                         }
-                        let mut b = HashMap::default();
-                        if !self.match_seq(inner, &mut j, end, &mut b) || j == start {
-                            break;
-                        }
-                        *i = j;
-                        iters.push(b);
-                        if *op == b'?' {
-                            break;
-                        }
+                        true
                     }
-                    if *op == b'+' && iters.is_empty() {
-                        return false;
+                }
+            };
+            if matched { continue; }
+            // this reading is refused: the last one left for later, as it was at its fork
+            // (arguments no arm matches can be read in ever more ways: rustc's threads grow so too)
+            let Some(fork) = open.pop().filter(|_| steps > 0) else { return false };
+            steps -= 1;
+            // (a fragment of the refused reading may have split a token, `>>`)
+            self.restore_match_tokens(fork.undo);
+            log.truncate(fork.log);
+            log.push(Bound::Exit);
+            (at, i, ends, starts) = (fork.at, fork.i, fork.ends, fork.starts);
+        }
+        // the fragments, each repetition's as a sequence of its iterations'
+        let mut maps: Vec<HashMap<String, Bind>> = vec![HashMap::default()];
+        let mut reps: Vec<(&[MNode], Vec<HashMap<String, Bind>>, bool)> = Vec::new();
+        for bound in log {
+            match bound {
+                Bound::Var(name, bind) => { maps.last_mut().unwrap().insert(name.to_string(), bind); }
+                Bound::Enter(inner) => reps.push((inner, Vec::new(), false)),
+                Bound::Iter | Bound::Exit => {
+                    let exit = matches!(bound, Bound::Exit);
+                    let Some(rep) = reps.last_mut() else { continue };
+                    if std::mem::replace(&mut rep.2, !exit) {
+                        let done = maps.pop().unwrap_or_default();
+                        rep.1.push(done);
                     }
+                    if !exit {
+                        maps.push(HashMap::default());
+                        continue;
+                    }
+                    let (inner, iters, _) = reps.pop().unwrap();
+                    let mut names = Vec::new();
+                    vars_of(inner, &mut names);
                     for nm in names {
                         let seq: Vec<Bind> = iters.iter().map(|b| b.get(&nm).cloned().unwrap_or(Bind::Seq(Vec::new()))).collect();
-                        binds.insert(nm, Bind::Seq(seq));
+                        maps.last_mut().unwrap().insert(nm, Bind::Seq(seq));
                     }
                 }
             }
         }
+        *binds = maps.swap_remove(0);
         true
     }
 
@@ -3397,11 +3531,10 @@ impl<'a> Parser<'a> {
         uses::used(def, uses::RESOLVED);
         for (arm, (matcher, body)) in def.arms.iter().enumerate() {
             let mut binds = HashMap::default();
-            let mut i = lo;
             // rustc_expand mbe/macro_rules.rs: try_match_macro starts each arm with
             // a fresh parser. A failed arm must not leave grammar-split tokens behind.
             let undo = self.tok_undo.len();
-            if self.match_seq(matcher, &mut i, hi, &mut binds) && i == hi {
+            if self.match_arm(matcher, lo, hi, &mut binds) {
                 uses::used(def, arm as u32);
                 // `$crate` names the defining crate by identity (rustc: the `$crate` token keeps the
                 // definition's hygiene), wherever the transcribed tokens end up: a caller that reaches
