@@ -454,7 +454,7 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
     // reuse stubs or nightly cfgs from a different native selection.
     let metadata = Command::new("cargo")
         .args(["metadata", "--format-version", "1", "--no-deps"])
-        .current_dir(workspace)
+        .current_dir(&*crate::vfs::on_disk(workspace))
         .env("CARGO_TARGET_DIR", &target)
         .output().map_err(|e| format!("native build directory: {e}"))?;
     if !metadata.status.success() {
@@ -480,7 +480,8 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
     if !cargo_flags.iter().any(|f| f == "--target" || f.starts_with("--target=")) {
         cmd.args(["--target", triple]);
     }
-    cmd.current_dir(workspace)
+    // (a shared workspace's folder is on no disk: cargo builds in its checkout)
+    cmd.current_dir(&*crate::vfs::on_disk(workspace))
         .args(cargo_flags)
         .env("CARGO_TARGET_DIR", &target)
         .env("CARGO_BUILD_BUILD_DIR", &build)
