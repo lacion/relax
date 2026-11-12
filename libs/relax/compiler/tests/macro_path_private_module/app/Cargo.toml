@@ -1,0 +1,8 @@
+[package]
+name = "path-app"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+pathdep = { path = "../dep" }

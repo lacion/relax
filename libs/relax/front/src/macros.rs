@@ -1138,16 +1138,9 @@ impl<'a> Res<'a> {
         found.map(|(_, _, t)| (t.0.as_str(), t.1.as_str()))
     }
 
-    /// `type_in` through glob sources (each module once per query); `partial`: the crate whose
-    /// scope is being computed and its tables so far.
-    fn type_in_seen<'b>(&self, k: &'b str, m: &'b str, n: &str, seen: &mut Seen<'b>, partial: Option<(&str, &'b CrateScope)>) -> Option<(&'b str, &'b str)>
-    where
-        'a: 'b,
-    {
-        self.glob_find(k, k, m, n, seen, partial).map(|(_, _, t)| (t.0.as_str(), t.1.as_str()))
-    }
-
-    /// `type_in_seen`, with the (crate, module) whose non-glob bindings had the name. `from`: the
+    /// `type_in` through glob sources (each module once per query), with the (crate, module)
+    /// whose non-glob bindings had the name; `partial`: the crate whose scope is being computed
+    /// and its tables so far. `from`: the
     /// crate asking; a module of another crate, reached through a glob, gives only what that
     /// crate exports (rustc: a glob imports the bindings visible to the importer), so its private
     /// `mod serde_json` neither binds the name nor hides the extern crate of that name.
@@ -1383,7 +1376,12 @@ impl CrateScope {
     /// The module a name denotes in module `mm` of crate `kk`: this crate's partial tables, a
     /// dependency's finished ones.
     fn lookup_type<'b>(&'b self, r: &Res<'b>, k: &str, kk: &'b str, mm: &'b str, n: &str) -> Option<(&'b str, &'b str)> {
-        r.type_in_seen(kk, mm, n, &mut Seen::new(), Some((k, self)))
+        // `k` asks: a module of another crate gives it only what that crate exports (rustc: every
+        // segment of a path is one the importer can see). zerovec has a private `mod zerovec` and
+        // exports a `zerovec!` macro: `use zerovec::zerovec;` imports the macro alone, and
+        // `zerovec` in that file is still the crate (`#[zerovec::make_varule(..)]` was looked for
+        // in the private module, not run, and the type it makes was an unresolved import).
+        r.glob_find(k, kk, mm, n, &mut Seen::new(), Some((k, self))).map(|(_, _, t)| (t.0.as_str(), t.1.as_str()))
     }
 
     fn lookup_macro(&self, r: &Res, k: &str, kk: &str, mm: &str, n: &str) -> Option<MacroRef> {
