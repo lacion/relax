@@ -199,6 +199,12 @@ unsafe fn from256_i32(a: [i32; 8]) -> __m256i {
 #[repr(C, align(64))]
 pub struct __m512i(pub [i64; 8]);
 
+// stdarch's AVX-512 mask types (library/stdarch/crates/core_arch/src/x86/mod.rs): one bit per lane.
+pub type __mmask8 = u8;
+pub type __mmask16 = u16;
+pub type __mmask32 = u32;
+pub type __mmask64 = u64;
+
 unsafe fn lanes512_i8(a: __m512i) -> [i8; 64] {
     crate::ptr::read_unaligned(&a as *const __m512i as *const [i8; 64])
 }
@@ -305,6 +311,14 @@ pub fn _mm256_castsi256_si128(a: __m256i) -> __m128i {
 #[inline]
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
 pub fn _mm256_castsi128_si256(a: __m128i) -> __m256i {
+    __m256i([a.0[0], a.0[1], 0, 0])
+}
+
+// rustc library/stdarch/crates/core_arch/src/x86/avx.rs: _mm256_zextsi128_si256, the upper
+// 128 bits zero (zlib-rs's AVX2 adler32).
+#[inline]
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx"))]
+pub fn _mm256_zextsi128_si256(a: __m128i) -> __m256i {
     __m256i([a.0[0], a.0[1], 0, 0])
 }
 
