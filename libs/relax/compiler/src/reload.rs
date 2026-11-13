@@ -8858,7 +8858,8 @@ struct Virtual {
 
 impl Virtual {
     fn of(files: &[(String, u32, Option<(std::time::SystemTime, u64)>)]) -> Virtual {
-        let is: Vec<bool> = files.iter().map(|f| crate::vfs::is_virtual(&f.0)).collect();
+        // Shared checkouts have no edits ledger; observe their files directly.
+        let is: Vec<bool> = files.iter().map(|f| !crate::vfs::shared() && crate::vfs::is_virtual(&f.0)).collect();
         let rels = files.iter().enumerate().filter(|&(k, _)| is[k]).filter_map(|(k, f)| Some((crate::vfs::edit_rel(&f.0)?, k))).collect();
         Virtual { is, rels }
     }
@@ -8937,7 +8938,7 @@ impl LiveWatch {
         let mut any_virtual = false;
         for (i, p) in paths.enumerate() {
             if crate::vfs::is_virtual(p) {
-                any_virtual = true;
+                any_virtual |= !crate::vfs::shared();
                 let Some(at) = crate::vfs::edit_location(p) else { continue };
                 if !at.parent().is_some_and(|d| d.is_dir()) { continue; }
                 watched.push(at.to_string_lossy().into_owned());
